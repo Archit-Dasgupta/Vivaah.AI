@@ -83,6 +83,44 @@ export default function Chat() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Listen to vendor card actions emitted from MessageWall and forward to sendMessage
+  useEffect(() => {
+    function handleMoreDetails(e: any) {
+      const vendorName = e?.detail?.vendorName;
+      if (!vendorName) return;
+      try {
+        sendMessage({
+          text: `More details on ${vendorName}`,
+          metadata: { sessionKey: getOrCreateSessionKey() },
+        });
+      } catch (err) {
+        // best-effort; ignore errors here
+        // console.warn("handleMoreDetails sendMessage failed", err);
+      }
+    }
+
+    function handleReviews(e: any) {
+      const vendorName = e?.detail?.vendorName;
+      if (!vendorName) return;
+      try {
+        sendMessage({
+          text: `Reviews for ${vendorName}`,
+          metadata: { sessionKey: getOrCreateSessionKey() },
+        });
+      } catch (err) {
+        // ignore
+      }
+    }
+
+    window.addEventListener("chat_action_more_details", handleMoreDetails);
+    window.addEventListener("chat_action_reviews", handleReviews);
+
+    return () => {
+      window.removeEventListener("chat_action_more_details", handleMoreDetails);
+      window.removeEventListener("chat_action_reviews", handleReviews);
+    };
+  }, [sendMessage]);
+
   // persist messages & durations defensively
   useEffect(() => {
     if (!isClient) return;
