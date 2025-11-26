@@ -1,8 +1,10 @@
 import { UIMessage } from "ai";
-import { useEffect, useRef, useMemo } from "react";
+import { useEffect, useRef } from "react";
+// Keep your original imports, but we will guard against them being undefined at runtime.
 import { UserMessage } from "./user-message";
 import { AssistantMessage } from "./assistant-message";
-import Image from "next/image";
+// Use plain img to avoid next/image domain config issues
+// import Image from "next/image";
 
 type Props = {
   messages: UIMessage[];
@@ -33,6 +35,35 @@ export function MessageWall({ messages, status, durations, onDurationChange }: P
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // ---- Guard component references so invalid imports don't crash the whole app ----
+  const SafeUserMessage: any =
+    typeof UserMessage === "function"
+      ? UserMessage
+      : // fallback simple renderer
+        ({ message }: { message: UIMessage }) => {
+          const text = (message.parts || []).map((p: any) => (p?.type === "text" ? p.text || "" : "")).join("");
+          return <div className="inline-block bg-white p-3 rounded shadow text-sm">{text}</div>;
+        };
+
+  const SafeAssistantMessage: any =
+    typeof AssistantMessage === "function"
+      ? AssistantMessage
+      : // fallback simple renderer for assistant content
+        ({ message }: { message: UIMessage }) => {
+          const text = (message.parts || []).map((p: any) => (p?.type === "text" ? p.text || "" : "")).join("");
+          return <div className="inline-block bg-white p-3 rounded shadow text-sm">{text}</div>;
+        };
+
+  // If either import was undefined, log which one so we can fix import paths.
+  if (typeof UserMessage !== "function") {
+    // eslint-disable-next-line no-console
+    console.warn("MessageWall: UserMessage import is not a function. Falling back to SafeUserMessage. Check ./user-message export (named vs default).", UserMessage);
+  }
+  if (typeof AssistantMessage !== "function") {
+    // eslint-disable-next-line no-console
+    console.warn("MessageWall: AssistantMessage import is not a function. Falling back to SafeAssistantMessage. Check ./assistant-message export (named vs default).", AssistantMessage);
+  }
+
   // Helper: join UIMessage parts into plain text
   function messageToText(m: UIMessage): string {
     try {
@@ -60,7 +91,7 @@ export function MessageWall({ messages, status, durations, onDurationChange }: P
       const parsed = JSON.parse(jsonStr);
       return Array.isArray(parsed) ? parsed : null;
     } catch (err) {
-      // parsing failed
+      // eslint-disable-next-line no-console
       console.warn("MessageWall: failed to parse vendor JSON sentinel", err);
       return null;
     }
@@ -76,12 +107,18 @@ export function MessageWall({ messages, status, durations, onDurationChange }: P
 
   // Emit window events so outer client can handle follow-ups without changing props
   function emitMoreDetails(vendorName: string | null) {
-    const ev = new CustomEvent("chat_action_more_details", { detail: { vendorName } });
-    window.dispatchEvent(ev);
+    try {
+      const ev = new CustomEvent("chat_action_more_details", { detail: { vendorName } });
+      window.dispatchEvent(ev);
+    } catch (e) {
+      // ignore where CustomEvent is restricted
+    }
   }
   function emitReviews(vendorName: string | null) {
-    const ev = new CustomEvent("chat_action_reviews", { detail: { vendorName } });
-    window.dispatchEvent(ev);
+    try {
+      const ev = new CustomEvent("chat_action_reviews", { detail: { vendorName } });
+      window.dispatchEvent(ev);
+    } catch (e) {}
   }
 
   function VendorCard({ v }: { v: VendorHit }) {
@@ -89,13 +126,18 @@ export function MessageWall({ messages, status, durations, onDurationChange }: P
       <div className="w-full border rounded-lg p-4 bg-white shadow-sm flex gap-4">
         <div className="w-24 h-24 rounded overflow-hidden bg-gray-100 flex-shrink-0">
           {v.images && v.images.length ? (
-            // Next/Image requires trusted domains in next.config.js — if failing, replace with <img>
-            <Image
+            // use regular img tag to avoid next/image domain config problems during debugging
+            // ensure URLs are absolute (http(s)://...) — if they are relative and 404, they'll still 404.
+            // We use onError to silence broken images.
+            // eslint-disable-next-line jsx-a11y/alt-text
+            <img
               src={v.images[0]}
-              alt={v.name ?? "vendor"}
-              width={96}
-              height={96}
-              style={{ objectFit: "cover" }}
+              style={{ width: 96, height: 96, objectFit: "cover" }}
+              onError={(e) => {
+                // hide broken image
+                // @ts-ignore
+                e.currentTarget.style.display = "none";
+              }}
             />
           ) : (
             <div className="w-full h-full flex items-center justify-center text-xs text-gray-500">No image</div>
@@ -151,25 +193,22 @@ export function MessageWall({ messages, status, durations, onDurationChange }: P
           const hits = message.role === "assistant" ? extractVendorHitsFromText(text) : null;
           const humanText = message.role === "assistant" ? stripSentinelFromText(text) : text;
 
-          // Build a shallow clone of the message with parts replaced by humanText so AssistantMessage does not render sentinel
-          const safeMessageForAssistant: UIMessage = useMemo(() => {
+          // Build a simple shallow clone object used only for passing to AssistantMessage
+          const safeMessageForAssistant: UIMessage = (() => {
             if (message.role !== "assistant") return message;
             const clone: any = { ...message };
             clone.parts = [{ type: "text", text: humanText }];
-            // remove raw content if any to avoid duplicate display
-            // @ts-ignore
             if (clone.content) clone.content = humanText;
             return clone;
-            // eslint-disable-next-line react-hooks/exhaustive-deps
-          }, [message, humanText]);
+          })();
 
           return (
             <div key={message.id} className="w-full">
               {message.role === "user" ? (
-                <UserMessage message={message} />
+                <SafeUserMessage message={message} />
               ) : (
                 <>
-                  <AssistantMessage
+                  <SafeAssistantMessage
                     message={safeMessageForAssistant}
                     status={status}
                     isLastMessage={isLastMessage}
