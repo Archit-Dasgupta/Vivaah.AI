@@ -1,6 +1,3 @@
-// Run this API route in Node.js runtime so Pinecone + OpenAI SDKs work reliably
-export const runtime = 'nodejs';
-
 import {
   streamText,
   UIMessage,
@@ -8,7 +5,6 @@ import {
   stepCountIs,
   createUIMessageStream,
   createUIMessageStreamResponse,
-  type ToolSet,
 } from 'ai';
 
 import { MODEL } from '@/config';
@@ -19,7 +15,8 @@ import { vectorDatabaseSearch } from './tools/search-vector-database';
 
 export const maxDuration = 30;
 
-// --------- helper to extract latest user text ----------
+/* ============== HELPERS ============== */
+
 function getLatestUserText(messages: UIMessage[]): string | null {
   const latestUserMessage = messages
     .filter((msg) => msg.role === 'user')
@@ -35,7 +32,6 @@ function getLatestUserText(messages: UIMessage[]): string | null {
   return textParts || null;
 }
 
-// --------- vendor query detection ----------
 function isVendorQuery(text: string | null): boolean {
   if (!text) return false;
   const t = text.toLowerCase();
@@ -64,27 +60,14 @@ function isVendorQuery(text: string | null): boolean {
   );
 }
 
-// --------- vendor-specific system prompt ----------
-const VENDOR_SYSTEM_PROMPT = `
-You are Vivaah, a wedding vendor recommendation assistant.
+/* ============== MAIN HANDLER ============== */
 
-When the user asks anything related to wedding vendors, you MUST:
-1. Call the "vectorDatabaseSearch" tool ONCE using the user's latest request as the "query" argument (and a suitable topK, e.g. 5), before you answer.
-2. Use ONLY the vendors returned by that tool as your primary source of truth.
-3. If the tool returns one or more vendors, recommend specific vendors by name with 2–3 key details (category, location, price range, or description). Do NOT stay generic or only ask clarifying questions.
-4. If the tool returns an empty list, say clearly that you currently do not have matching vendors in the database and ask a short follow-up question if needed. Never invent or guess vendor names.
-
-Assume Mumbai by default unless the user clearly specifies another city.
-Keep answers under 100 words and be clear and concise.
-`.trim();
-
-// ================== MAIN HANDLER ==================
 export async function POST(req: Request) {
   const { messages }: { messages: UIMessage[] } = await req.json();
 
-  const latestUserText = getLatestUserText(messages);
+  const latestUserText = getLatestUserText(messages) ?? '';
 
-  // --------- Moderation ----------
+  // ---------- Moderation ----------
   if (latestUserText) {
     const moderationResult = await isContentFlagged(latestUserText);
 
@@ -121,24 +104,74 @@ export async function POST(req: Request) {
     }
   }
 
-  // --------- decide mode (vendor vs normal) ----------
   const vendorMode = isVendorQuery(latestUserText);
-  const systemPrompt = vendorMode ? VENDOR_SYSTEM_PROMPT : SYSTEM_PROMPT;
 
-  // --------- tools selection with explicit typing ----------
-  let tools: ToolSet | undefined;
-
+  // ---------- VENDOR MODE: DIRECT PINECONE CALL ----------
   if (vendorMode) {
-    tools = { webSearch, vectorDatabaseSearch };
-  } else {
-    tools = { webSearch };
+    const stream = createUIMessageStream({
+      async execute({ writer }) {
+        const textId = 'vendor-response';
+
+        writer.write({ type: 'start' });
+        writer.write({ type: 'text-start', id: textId });
+
+        try {
+          // call our Pinecone tool directly (bypass AI tool plumbing)
+          const result = await (vectorDatabaseSearch as any).execute({
+            query: latestUserText,
+            topK: 5,
+          });
+
+          const vendors = (result?.vendors ?? []) as any[];
+
+          if (!vendors.length) {
+            writer.write({
+              type: 'text-delta',
+              id: textId,
+              delta:
+                "I couldn’t find any vendors in my database for that request. Try specifying the type of vendor (e.g., photographers, caterers) or a different area in Mumbai.",
+            });
+          } else {
+            const lines = vendors.slice(0, 5).map((v, idx) => {
+              const name = v.name || 'Unnamed vendor';
+              const category = v.category || 'Vendor';
+              const location = v.location || 'Mumbai';
+              const price = v.price_range ? `, approx ${v.price_range}` : '';
+              return `${idx + 1}. ${name} – ${category}, ${location}${price}`;
+            });
+
+            const header =
+              'Here are some vendors in Mumbai based on your request:\n\n';
+            writer.write({
+              type: 'text-delta',
+              id: textId,
+              delta: header + lines.join('\n'),
+            });
+          }
+        } catch (err) {
+          console.error('Vendor mode error:', err);
+          writer.write({
+            type: 'text-delta',
+            id: textId,
+            delta:
+              'Something went wrong while fetching vendors. Please try again in a moment.',
+          });
+        }
+
+        writer.write({ type: 'text-end', id: textId });
+        writer.write({ type: 'finish' });
+      },
+    });
+
+    return createUIMessageStreamResponse({ stream });
   }
 
+  // ---------- NORMAL MODE: REGULAR OPENAI CHAT ----------
   const result = streamText({
     model: MODEL,
-    system: systemPrompt,
+    system: SYSTEM_PROMPT,
     messages: convertToModelMessages(messages),
-    tools,
+    tools: { webSearch },
     stopWhen: stepCountIs(10),
     providerOptions: {
       openai: {
