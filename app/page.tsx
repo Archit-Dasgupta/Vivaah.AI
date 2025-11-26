@@ -36,6 +36,7 @@ export default function Chat() {
   const welcomeMessageShownRef = useRef(false);
   const [durations, setDurations] = useState<Record<string, number>>({});
 
+  // Safely read from localStorage only on client
   const stored =
     typeof window !== "undefined"
       ? JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}")
@@ -51,6 +52,7 @@ export default function Chat() {
     setIsClient(true);
     setDurations(stored.durations || {});
     setMessages(stored.messages || []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -90,13 +92,18 @@ export default function Chat() {
   const clearChat = () => {
     setMessages([]);
     setDurations({});
-    localStorage.removeItem(STORAGE_KEY);
+    if (typeof window !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
     toast.success("Chat cleared");
   };
 
   function onSubmit(data: z.infer<typeof formSchema>) {
-    // Add sessionKey to every outgoing chat message
-    sendMessage({ text: data.message, sessionKey: getOrCreateSessionKey() });
+    // Place sessionKey inside metadata — this matches the sendMessage type contract
+    sendMessage({
+      text: data.message,
+      metadata: { sessionKey: getOrCreateSessionKey() },
+    });
     form.reset();
   }
 
@@ -143,7 +150,20 @@ export default function Chat() {
                   messages={messages}
                   status={status}
                   durations={durations}
-                  onDurationChange={(d, k) => {}}
+                  // Persist duration changes coming from MessageWall
+                  onDurationChange={(durationMs: number, messageId: string) => {
+                    setDurations((prev) => {
+                      const updated = { ...prev, [messageId]: durationMs };
+                      // persist immediately to localStorage when on client
+                      if (typeof window !== "undefined") {
+                        localStorage.setItem(
+                          STORAGE_KEY,
+                          JSON.stringify({ messages, durations: updated })
+                        );
+                      }
+                      return updated;
+                    });
+                  }}
                 />
                 {status === "submitted" && (
                   <Loader2 className="size-4 animate-spin text-[var(--text-maroon)]" />
@@ -190,7 +210,10 @@ export default function Chat() {
                           <Button
                             size="icon"
                             className="absolute right-3 top-3 bg-[var(--gold-2)]"
-                            onClick={() => stop()}
+                            onClick={(e) => {
+                              e.preventDefault();
+                              stop();
+                            }}
                           >
                             <Square className="size-4 text-white" />
                           </Button>
