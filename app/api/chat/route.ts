@@ -1,3 +1,6 @@
+// Run this API route in Node.js runtime so Pinecone + OpenAI SDKs work reliably
+export const runtime = 'nodejs';
+
 import {
   streamText,
   UIMessage,
@@ -5,8 +8,8 @@ import {
   stepCountIs,
   createUIMessageStream,
   createUIMessageStreamResponse,
+  type ToolSet,
 } from 'ai';
-import type { ToolSet } from 'ai';
 
 import { MODEL } from '@/config';
 import { SYSTEM_PROMPT } from '@/prompts';
@@ -39,12 +42,17 @@ function isVendorQuery(text: string | null): boolean {
 
   const vendorKeywords = [
     'vendor',
+    'vendors',
     'caterer',
+    'caterers',
     'venue',
+    'venues',
     'wedding',
     'photographer',
+    'photographers',
     'makeup',
     'decorator',
+    'decor',
     'dj',
     'banquet',
   ];
@@ -56,6 +64,7 @@ function isVendorQuery(text: string | null): boolean {
   );
 }
 
+// --------- vendor-specific system prompt ----------
 const VENDOR_SYSTEM_PROMPT = `
 You are Vivaah, a wedding vendor recommendation assistant.
 
@@ -68,7 +77,6 @@ When the user asks anything related to wedding vendors, you MUST:
 Assume Mumbai by default unless the user clearly specifies another city.
 Keep answers under 100 words and be clear and concise.
 `.trim();
-
 
 // ================== MAIN HANDLER ==================
 export async function POST(req: Request) {
