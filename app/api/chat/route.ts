@@ -18,8 +18,7 @@ import { vectorDatabaseSearch } from "./tools/search-vector-database";
  * Chat handler (app router)
  *
  * Notes:
- * - This handler is defensive: it accepts either { messages: UIMessage[] } or { message: string } payloads.
- * - It logs at key points so you can view Vercel function logs to debug.
+ * - This handler accepts either { messages: UIMessage[] } or { message: string } payloads.
  * - Vendor mode short-circuits to a direct vector DB query and streams a friendly vendor list.
  */
 
@@ -136,6 +135,7 @@ export async function POST(req: Request) {
   const vendorMode = isVendorQuery(latestUserText);
   if (vendorMode) {
     console.log("[chat] entering vendor mode");
+
     const stream = createUIMessageStream({
       async execute({ writer }) {
         const textId = "vendor-response";
@@ -143,40 +143,96 @@ export async function POST(req: Request) {
         writer.write({ type: "text-start", id: textId });
 
         try {
-          // call the vector DB tool. We tolerate different tool interfaces by trying a couple of common names.
+          // Compose full user conversation text so follow-ups inherit prior context.
+          const allUserParts = (messages ?? [])
+            .filter((m) => m.role === "user")
+            .map((m) =>
+              (m.parts ?? [])
+                .filter((p: any) => p.type === "text")
+                .map((p: any) => ("text" in p ? p.text : ""))
+                .join("")
+            )
+            .filter(Boolean);
+
+          const composedQuery = allUserParts.join(" ").trim() || latestUserText || "";
+          console.log("[chat][vendor mode] composedQuery:", composedQuery);
+
+          // Call the vector DB tool; tolerate different interfaces.
           let result: any;
           try {
             // preferred shape: execute({ query, topK })
-            result = await (vectorDatabaseSearch as any).execute({
-              query: latestUserText,
-              topK: 5,
+            result = await (vectorDatabaseSearch as any).execute?.({
+              query: composedQuery,
+              topK: 8,
             });
           } catch (e1) {
             console.warn("[chat] vectorDatabaseSearch.execute failed, trying fallback interface", e1);
-            // fallback: vectorDatabaseSearch({ q, topK })
             try {
-              result = await (vectorDatabaseSearch as any)(latestUserText, 5);
+              // fallback: vectorDatabaseSearch(query, topK)
+              result = await (vectorDatabaseSearch as any)(composedQuery, 8);
             } catch (e2) {
               console.error("[chat] both vector search attempts failed:", e2);
               throw e2;
             }
           }
 
-          const vendors = (result?.vendors ?? result?.results ?? []) as any[];
+          // Debug: print raw result for inspection in logs
+          try {
+            const raw = JSON.stringify(result, null, 2);
+            console.log("[chat][vendor mode] raw vector result:", raw.slice(0, 10000));
+          } catch (jerr) {
+            console.log("[chat][vendor mode] raw vector result (non-serializable)", result);
+          }
+
+          // Normalize vendor list from multiple possible shapes:
+          // - result.vendors, result.results, result.items
+          // - result.matches (pinecone-like) with .metadata and .score
+          // - result.hits with .document/.payload/.metadata
+          let vendors: any[] = [];
+
+          if (Array.isArray(result?.vendors) && result.vendors.length) {
+            vendors = result.vendors;
+          } else if (Array.isArray(result?.results) && result.results.length) {
+            vendors = result.results;
+          } else if (Array.isArray(result?.items) && result.items.length) {
+            vendors = result.items;
+          } else if (Array.isArray(result?.matches) && result.matches.length) {
+            vendors = result.matches.map((m: any) => ({
+              ...(m.metadata ?? {}),
+              _score: m.score ?? m.similarity ?? undefined,
+              _id: m.id ?? undefined,
+            }));
+          } else if (Array.isArray(result?.hits) && result.hits.length) {
+            vendors = result.hits.map((h: any) => ({
+              ...(h.document ?? h.payload ?? h.metadata ?? h),
+              _score: h.score ?? h._score ?? undefined,
+              _id: h.id ?? undefined,
+            }));
+          } else if (Array.isArray(result) && result.length) {
+            vendors = result;
+          } else {
+            vendors = [];
+          }
+
+          vendors = vendors.filter(Boolean);
 
           if (!vendors || vendors.length === 0) {
             writer.write({
               type: "text-delta",
               id: textId,
-              delta:
-                "I couldn’t find any vendors in my database for that request. Try specifying the type of vendor (e.g., photographers, caterers) or a different area in Mumbai.",
+              delta: `I couldn’t find any vendors in my database for that request. I searched for: "${composedQuery}".\n\nYou can: 1) specify a neighbourhood (e.g., "Powai"), 2) give a budget, 3) allow me to search the web for vendor options, or 4) add vendors to the database.`,
             });
           } else {
-            // format each vendor defensively (city vs location, price_range vs min/max)
-            const lines = vendors.slice(0, 5).map((v: any, idx: number) => {
-              const name = v.name ?? v.title ?? "Unnamed vendor";
-              const category = v.category ?? v.sub_category ?? "Vendor";
-              const city = v.city ?? v.location ?? "Mumbai";
+            const lines = vendors.slice(0, 8).map((v: any, idx: number) => {
+              const name = v.name ?? v.title ?? v.vendor_name ?? v.provider ?? "Unnamed vendor";
+              const category =
+                v.category ??
+                v.vendor_type ??
+                v.sub_category ??
+                v.type ??
+                v.tag ??
+                "Vendor";
+              const city = v.city ?? v.location ?? v.town ?? "Mumbai";
               let price = "";
               if (v.price_range) {
                 price = `, approx ${v.price_range}`;
@@ -185,10 +241,12 @@ export async function POST(req: Request) {
                 const mx = v.max_price ?? "";
                 price = `, approx ${mn}${mn && mx ? "-" : ""}${mx}`.replace(/(^, )|(^, $)/, "");
               }
-              return `${idx + 1}. ${name} – ${category}, ${city}${price}`;
+              let contact = v.phone ?? v.contact ?? (v.metadata && v.metadata.phone) ?? "";
+              if (contact) contact = `, contact: ${contact}`;
+              return `${idx + 1}. ${name} – ${category}, ${city}${price}${contact}`;
             });
 
-            const header = "Here are some vendors based on your request:\n\n";
+            const header = `Here are some vendors I found for "${composedQuery}":\n\n`;
             writer.write({ type: "text-delta", id: textId, delta: header + lines.join("\n") });
           }
         } catch (err) {
@@ -196,7 +254,7 @@ export async function POST(req: Request) {
           writer.write({
             type: "text-delta",
             id: textId,
-            delta: "Something went wrong while fetching vendors. Please try again in a moment.",
+            delta: "Something went wrong while fetching vendors. Please try again in a moment, or ask me to search the web for vendor options.",
           });
         } finally {
           try {
