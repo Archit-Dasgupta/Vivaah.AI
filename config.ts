@@ -55,6 +55,10 @@ export const MODERATION_DENIAL_MESSAGE_SELF_HARM_INTENT = "I can't discuss self-
 export const MODERATION_DENIAL_MESSAGE_SELF_HARM_INSTRUCTIONS = "I can't provide instructions related to self-harm. If you're struggling, please reach out to a mental health professional or crisis helpline.";
 export const MODERATION_DENIAL_MESSAGE_VIOLENCE = "I can't discuss violent content. Please ask something else.";
 export const MODERATION_DENIAL_MESSAGE_VIOLENCE_GRAPHIC = "I can't discuss graphic violent content. Please ask something else.";
+export const MODERATION_DENIAL_MESSAGE_MEDICAL = "I can't provide medical or health-related instructions. Please consult a qualified healthcare professional.";
+export const MODERATION_DENIAL_MESSAGE_LEGAL = "I can't provide legal advice. Please consult a qualified legal professional.";
+export const MODERATION_DENIAL_MESSAGE_FINANCIAL = "I can't provide personalised financial advice. Please consult a certified financial planner.";
+export const MODERATION_DENIAL_MESSAGE_EXTREMISM = "I can't engage with extremist or radicalization-related content. Please ask something else.";
 export const MODERATION_DENIAL_MESSAGE_DEFAULT = "Your message violates our guidelines. I can't answer that.";
 
 export const PINECONE_TOP_K = 40;
