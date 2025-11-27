@@ -33,11 +33,12 @@ export const DATE_AND_TIME = getDateAndTime();
 export const AI_NAME = "Viv";
 export const OWNER_NAME = "Vivaah.ai";
 
-export const WELCOME_MESSAGE = `Hello! I'm ${AI_NAME} (Vivaah Intelligent Virtual-assistant), an AI assistant created by ${OWNER_NAME}, (founders: Archit Dasgupta & Mohammed Faraaz).  
+export const WELCOME_MESSAGE = `Hello! I'm ${AI_NAME} (Vivaah Intelligent Virtual-assistant), an AI assistant   
 I help couples and planners in Mumbai make wedding planning simple, fast and stress-free.
 
 What I can do for you:
-• **Budget planning** — tell me your total budget and I’ll create an ideal breakdown across categories (venue, catering, photography, decor, attire, logistics, contingency, etc.) and suggest allocation amounts per vendor.  
+• **Budget planning** — tell me your total budget and I’ll create an ideal breakdown across categories (venue, catering, photography, decor, attire, logistics, contingency, etc.) and suggest allocation amounts per vendor.
+
 • **Vendor discovery** — I can find vendors in Mumbai across categories, aggregate their contact details, sample pricing, reviews and ratings, and present a short-list that matches your budget and style.`
 
 export const CLEAR_CHAT_TEXT = "New";
