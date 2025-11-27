@@ -16,14 +16,13 @@ import { webSearch } from "./tools/web-search";
 import { vectorDatabaseSearch } from "./tools/search-vector-database";
 
 import { createClient } from "@supabase/supabase-js";
+import { getVendorDetails } from "@/lib/db/getVendorDetails";
 
 /**
- * Robust, defensive chat route implementing:
- *  - vendor mode (semantic vector search + DB enrichment)
- *  - "More details on X" and "Reviews for X"
- *  - conversational summaries + structured JSON sentinel
- *
- * Keep @ts-nocheck for maximum tolerance against type mismatches.
+ * Chat route with:
+ * - vendor mode (vector search + DB enrichment)
+ * - "More details" and "Reviews"
+ * - GUIDE flow for curated guides (structured JSON sentinel + pretty text)
  */
 
 // initialize supabase server client only if env available
@@ -67,6 +66,9 @@ function isVendorQuery(text: string | null): boolean {
     "banquet",
     "vendors in",
     "vendors near",
+    "best caterers",
+    "top caterers",
+    "guide",
   ];
   const cityKeywords = ["mumbai", "bombay"];
   return vendorKeywords.some((k) => t.includes(k)) || cityKeywords.some((c) => t.includes(c));
@@ -123,6 +125,14 @@ function extractVendorNameFromReviews(text: string | null) {
   return null;
 }
 
+function isGuideQuery(text: string | null) {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  return /\b(guide|best|top|recommend|who should i|find me|best caterers|top caterers|guide to)\b/.test(t)
+    && /\bcaterer|caterers|vendors|venues\b/.test(t);
+}
+
+// Normalizes many possible vector DB shapes into a flat list of objects
 async function normalizeVectorResults(result: any): Promise<any[]> {
   try {
     if (!result) return [];
@@ -134,7 +144,7 @@ async function normalizeVectorResults(result: any): Promise<any[]> {
     else if (Array.isArray(result.matches) && result.matches.length) {
       vendors = result.matches.map((m: any) => ({
         ...(m.metadata ?? {}),
-        _score: m.score ?? m.similarity ?? undefined,
+        _score: (m.score ?? m.similarity) ?? undefined,
         _id: m.id ?? undefined,
       }));
     } else if (Array.isArray(result.hits) && result.hits.length) {
@@ -149,6 +159,42 @@ async function normalizeVectorResults(result: any): Promise<any[]> {
     return vendors.map((v: any) => (typeof v === "object" ? v : { text: String(v) }));
   } catch (e) {
     return [];
+  }
+}
+
+// Safe wrapper to call OpenAI Chat Completions directly via fetch (optional)
+async function callOpenAIChat(prompt: string, opts: { model?: string; max_tokens?: number } = {}) {
+  if (!process.env.OPENAI_API_KEY) return null;
+  try {
+    const model = opts.model || "gpt-4o-mini";
+    const body = {
+      model,
+      messages: [
+        { role: "system", content: "You are a strict editor. Do not hallucinate. Use only provided facts." },
+        { role: "user", content: prompt },
+      ],
+      max_tokens: opts.max_tokens ?? 800,
+      temperature: 0.0,
+    };
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      console.warn("[openai] non-ok response:", res.status, txt);
+      return null;
+    }
+    const json = await res.json();
+    const content = json?.choices?.[0]?.message?.content ?? null;
+    return content;
+  } catch (e) {
+    console.warn("[openai] call failed:", e);
+    return null;
   }
 }
 
@@ -230,80 +276,310 @@ export async function POST(req: Request) {
           const composedQuery = (latestUserText || "").trim();
           console.log("[chat][vendor mode] composedQuery:", composedQuery);
 
-          // Handle "more details" intent
+          // ---------- GUIDE flow ----------
+          if (isGuideQuery(composedQuery)) {
+            try {
+              const category = parseCategory(composedQuery) || "caterer";
+              // Determine city if present in query, default to Mumbai
+              const cityMatch = composedQuery.match(/\b(mumbai|bombay)\b/i);
+              const city = cityMatch ? cityMatch[1] : "Mumbai";
+
+              // Fetch curated vendor lists (lightweight queries)
+              // Note: These are heuristics — you can refine later to use ranking function
+              const luxuryQ = supabase
+                ? supabase
+                    .from("vendors")
+                    .select("id, name, short_description, min_price, max_price, currency, city, category, avg_rating, rating_count")
+                    .eq("category", category)
+                    .ilike("city", `%${city}%`)
+                    .order("avg_rating", { ascending: false })
+                    .limit(6)
+                : { data: [] };
+              const vegQ = supabase
+                ? supabase
+                    .from("vendors")
+                    .select("id, name, short_description, min_price, max_price, currency, city, category, avg_rating, rating_count")
+                    .eq("category", category)
+                    .ilike("city", `%${city}%`)
+                    .ilike("short_description", "%veg%")
+                    .order("avg_rating", { ascending: false })
+                    .limit(6)
+                : { data: [] };
+              const regionalQ = supabase
+                ? supabase
+                    .from("vendors")
+                    .select("id, name, short_description, min_price, max_price, currency, city, category, avg_rating, rating_count")
+                    .eq("category", category)
+                    .ilike("city", `%${city}%`)
+                    .order("rating_count", { ascending: false })
+                    .limit(8)
+                : { data: [] };
+              const budgetQ = supabase
+                ? supabase
+                    .from("vendors")
+                    .select("id, name, short_description, min_price, max_price, currency, city, category, avg_rating, rating_count")
+                    .eq("category", category)
+                    .ilike("city", `%${city}%`)
+                    .order("min_price", { ascending: true })
+                    .limit(8)
+                : { data: [] };
+
+              const [luxRes, vegRes, regRes, budRes] = await Promise.all([luxuryQ, vegQ, regionalQ, budgetQ]);
+
+              const luxury = (luxRes?.data || []).slice(0, 6);
+              const veg = (vegRes?.data || []).slice(0, 6);
+              const regional = (regRes?.data || []).slice(0, 6);
+              const budget = (budRes?.data || []).slice(0, 6);
+
+              // Build factual JSON facts (minimal)
+              const facts = {
+                city,
+                category,
+                buckets: {
+                  ultra_luxury: luxury.map((v: any) => ({
+                    id: v.id,
+                    name: v.name,
+                    short_description: v.short_description,
+                    min_price: v.min_price,
+                    max_price: v.max_price,
+                    currency: v.currency,
+                    avg_rating: v.avg_rating,
+                    rating_count: v.rating_count,
+                  })),
+                  pure_veg: veg.map((v: any) => ({
+                    id: v.id,
+                    name: v.name,
+                    short_description: v.short_description,
+                    min_price: v.min_price,
+                    max_price: v.max_price,
+                    currency: v.currency,
+                    avg_rating: v.avg_rating,
+                    rating_count: v.rating_count,
+                  })),
+                  regional: regional.map((v: any) => ({
+                    id: v.id,
+                    name: v.name,
+                    short_description: v.short_description,
+                    min_price: v.min_price,
+                    max_price: v.max_price,
+                    currency: v.currency,
+                    avg_rating: v.avg_rating,
+                    rating_count: v.rating_count,
+                  })),
+                  budget: budget.map((v: any) => ({
+                    id: v.id,
+                    name: v.name,
+                    short_description: v.short_description,
+                    min_price: v.min_price,
+                    max_price: v.max_price,
+                    currency: v.currency,
+                    avg_rating: v.avg_rating,
+                    rating_count: v.rating_count,
+                  })),
+                },
+              };
+
+              // Build prompt for polishing but warn model not to hallucinate
+              const prompt = `
+You are an editor. Use ONLY the factual vendor data in the JSON block below to create a concise, human-friendly guide titled "Top wedding ${category}s in ${city}".
+- Produce sections: Ultra-Luxury Tier, Pure Vegetarian, Regional Specialties, Mid-range / Affordable.
+- For each vendor include: Name (bold), 1-sentence refined descriptor derived strictly from short_description, and an Estimated Price (min-max + currency). If price fields missing, write "Price not provided".
+- After sections, provide 3 brief insider tips (no more than 1 sentence each).
+- Do NOT add facts not present in the JSON. If a field is missing, write "Details not provided".
+- Output two pieces concatenated, separated by the sentinel line: "___GUIDE_JSON___" then a JSON object:
+{
+  "title": "...",
+  "sections": [
+    {"name":"Ultra-Luxury Tier","vendors":[ { "name":"", "descriptor":"", "price":"", "id":"" }, ... ] },
+    ...
+  ],
+  "insider_tips": ["...", "...", "..."]
+}
+- After that sentinel, output the human-readable guide as plain text for display.
+
+FACTS:
+${JSON.stringify(facts)}
+`;
+
+              // Call OpenAI if key present, else fallback to DB-only formatted text
+              const llmResp = await callOpenAIChat(prompt, { model: "gpt-4o-mini", max_tokens: 900 });
+
+              if (llmResp) {
+                // write what model returned (it should contain the sentinel + JSON + guide)
+                writer.write({ type: "text-delta", id: textId, delta: llmResp });
+              } else {
+                // fallback: deterministic textual guide built from facts
+                const fallback = [];
+                fallback.push(`Top wedding ${category}s in ${city}\n`);
+                fallback.push("Ultra-Luxury Tier:");
+                luxury.forEach((v: any) =>
+                  fallback.push(`- **${v.name}** — ${v.short_description || "Details not provided"}. Price: ${v.min_price ?? "Price not provided"} - ${v.max_price ?? ""} ${v.currency ?? ""}`)
+                );
+                fallback.push("\nPure Vegetarian:");
+                veg.forEach((v: any) =>
+                  fallback.push(`- **${v.name}** — ${v.short_description || "Details not provided"}. Price: ${v.min_price ?? "Price not provided"} - ${v.max_price ?? ""} ${v.currency ?? ""}`)
+                );
+                fallback.push("\nRegional Specialties:");
+                regional.forEach((v: any) =>
+                  fallback.push(`- **${v.name}** — ${v.short_description || "Details not provided"}. Price: ${v.min_price ?? "Price not provided"} - ${v.max_price ?? ""} ${v.currency ?? ""}`)
+                );
+                fallback.push("\nMid-range / Affordable:");
+                budget.forEach((v: any) =>
+                  fallback.push(`- **${v.name}** — ${v.short_description || "Details not provided"}. Price: ${v.min_price ?? "Price not provided"} - ${v.max_price ?? ""} ${v.currency ?? ""}`)
+                );
+                fallback.push("\nInsider tips:\n- Ask for floating crowd adjustments.\n- Use live stations to boost perceived quality.\n- Check venue tie-ups with your venue first.");
+                // produce a basic JSON sentinel as a fallback too
+                const guideJson = {
+                  title: `Top wedding ${category}s in ${city}`,
+                  sections: [
+                    { name: "Ultra-Luxury Tier", vendors: luxury.map((v: any) => ({ id: v.id, name: v.name, descriptor: v.short_description || "Details not provided", price: v.min_price ? `${v.min_price} - ${v.max_price ?? ""} ${v.currency ?? ""}` : "Price not provided" })) },
+                    { name: "Pure Vegetarian", vendors: veg.map((v: any) => ({ id: v.id, name: v.name, descriptor: v.short_description || "Details not provided", price: v.min_price ? `${v.min_price} - ${v.max_price ?? ""} ${v.currency ?? ""}` : "Price not provided" })) },
+                    { name: "Regional Specialties", vendors: regional.map((v: any) => ({ id: v.id, name: v.name, descriptor: v.short_description || "Details not provided", price: v.min_price ? `${v.min_price} - ${v.max_price ?? ""} ${v.currency ?? ""}` : "Price not provided" })) },
+                    { name: "Mid-range / Affordable", vendors: budget.map((v: any) => ({ id: v.id, name: v.name, descriptor: v.short_description || "Details not provided", price: v.min_price ? `${v.min_price} - ${v.max_price ?? ""} ${v.currency ?? ""}` : "Price not provided" })) },
+                  ],
+                  insider_tips: ["Ask for floating crowd adjustments.", "Use live stations to boost perceived quality.", "Check venue tie-ups before confirming outside caterers."],
+                };
+                writer.write({ type: "text-delta", id: textId, delta: `___GUIDE_JSON___${JSON.stringify(guideJson)}___END_GUIDE_JSON___\n\n${fallback.join("\n\n")}` });
+              }
+
+              writer.write({ type: "text-end", id: textId });
+              writer.write({ type: "finish" });
+              return;
+            } catch (e) {
+              console.warn("[guide] failure:", e);
+              writer.write({ type: "text-delta", id: textId, delta: "Sorry — I couldn't assemble the guide right now. Try again." });
+              writer.write({ type: "text-end", id: textId });
+              writer.write({ type: "finish" });
+              return;
+            }
+          }
+
+          // ---------- MORE DETAILS flow ----------
           if (isMoreDetailsQuery(composedQuery)) {
             const vendorName = extractVendorNameFromMoreDetails(composedQuery);
             if (!vendorName) {
               writer.write({ type: "text-delta", id: textId, delta: "Which vendor would you like more details for? Please say 'More details on <name>'." });
-            } else {
-              // vector search by name (tolerant)
-              let searchRes = null;
+              writer.write({ type: "text-end", id: textId });
+              writer.write({ type: "finish" });
+              return;
+            }
+
+            // vector-search tolerant lookup
+            let searchRes = null;
+            try {
+              searchRes = await (vectorDatabaseSearch as any).execute?.({ query: vendorName, topK: 8 });
+            } catch (e1) {
               try {
-                searchRes = await (vectorDatabaseSearch as any).execute?.({ query: vendorName, topK: 8 });
-              } catch (e1) {
-                try {
-                  searchRes = await (vectorDatabaseSearch as any)(vendorName, 8);
-                } catch (e2) {
-                  console.warn("[chat] vector search for details failed:", e2);
-                }
+                searchRes = await (vectorDatabaseSearch as any)(vendorName, 8);
+              } catch (e2) {
+                console.warn("[chat] vector search for details failed:", e2);
               }
-              const vectCandidates = await normalizeVectorResults(searchRes);
+            }
+            const vectCandidates = await normalizeVectorResults(searchRes);
 
-              // attempt DB enrichment
-              let dbVendor = null;
+            let details = null;
+            try {
+              const vid = vectCandidates.map((v) => v.vendor_id || v._id || v.id).find(Boolean);
+              if (vid) {
+                details = await getVendorDetails(String(vid));
+              }
+              if (!details && supabase) {
+                const { data: found } = await supabase.from("vendors").select("id, name").ilike("name", `%${vendorName}%`).limit(1).maybeSingle();
+                if (found && found.id) details = await getVendorDetails(String(found.id));
+              }
+            } catch (e) {
+              console.warn("[chat] getVendorDetails lookup failed:", e);
+            }
+
+            if (details && details.vendor) {
+              const v = details.vendor || {};
+              const parts = [];
+
+              // Title
+              parts.push(`**${v.name || "Vendor"}**`);
+
+              // Description (prefer short_description)
+              if (v.short_description) parts.push(v.short_description);
+              else if (v.long_description) parts.push(v.long_description);
+
+              // Price line: from offers or vendor columns
               try {
-                if (supabase) {
-                  // prefer vendor_id from metadata
-                  const vid = vectCandidates.map((v) => v.vendor_id || v._id || v.id).find(Boolean);
-                  if (vid) {
-                    const { data } = await supabase.from("vendors").select("*").eq("id", vid).limit(1).maybeSingle();
-                    dbVendor = data || null;
-                  }
-                  if (!dbVendor) {
-                    // name-based fallback
-                    const { data } = await supabase.from("vendors").select("*").ilike("name", `%${vendorName}%`).limit(1).maybeSingle();
-                    dbVendor = data || null;
-                  }
-                }
-              } catch (e) {
-                console.warn("[chat] supabase details fetch failed:", e);
-              }
-
-              if (dbVendor) {
-                const parts = [];
-                parts.push(`**${dbVendor.name || "Vendor"}**`);
-                if (dbVendor.description) parts.push(dbVendor.description);
-                if (dbVendor.city) parts.push(`City: ${dbVendor.city}`);
-                if (dbVendor.category) parts.push(`Category: ${dbVendor.category}`);
-                if (dbVendor.is_veg !== undefined) parts.push(`Veg-only: ${dbVendor.is_veg ? "Yes" : "No"}`);
-                if (dbVendor.price_min || dbVendor.price_max) parts.push(`Price range: ${dbVendor.price_min || "NA"} - ${dbVendor.price_max || "NA"}`);
-                if (dbVendor.contact) parts.push(`Contact: ${dbVendor.contact}`);
-                if (dbVendor.images && Array.isArray(dbVendor.images) && dbVendor.images.length) parts.push(`Images: ${dbVendor.images.slice(0, 5).join(", ")}`);
-                if (dbVendor.rating) parts.push(`Rating: ${dbVendor.rating}/5`);
-
-                // optional: include top 3 reviews
-                try {
-                  if (dbVendor.id && supabase) {
-                    const { data: revs } = await supabase.from("vendor_reviews").select("rating, text, author, created_at").eq("vendor_id", dbVendor.id).order("created_at", { ascending: false }).limit(3);
-                    if (revs && revs.length) {
-                      parts.push("Recent reviews:");
-                      for (const r of revs) parts.push(`- ${r.rating}/5 ${r.author ? `by ${r.author}: ` : ""}${r.text}`);
-                    }
-                  }
-                } catch (e) {
-                  // ignore review errors
-                }
-
-                writer.write({ type: "text-delta", id: textId, delta: parts.join("\n\n") });
-              } else {
-                // fallback to web search
-                const webRes = await webSearch(vendorName, { limit: 3 }).catch(() => null);
-                if (webRes && webRes.length) {
-                  const summary = webRes.slice(0, 3).map((r: any, i: number) => `${i + 1}. ${r.title || r.name}\n${r.snippet || r.summary || ""}\n${r.url || ""}`).join("\n\n");
-                  writer.write({ type: "text-delta", id: textId, delta: `Couldn't find this vendor in the internal DB. Here's what I found on the web:\n\n${summary}` });
+                let priceLine = "";
+                if (details.offers && details.offers.length) {
+                  const offer = details.offers[0];
+                  const p = offer.price ? `${offer.price} ${offer.currency || details.vendor.currency || "INR"}` : null;
+                  if (p) priceLine = `Example offer: ${offer.title || ""} — ${p}`;
                 } else {
-                  writer.write({ type: "text-delta", id: textId, delta: `I couldn't find details for "${vendorName}".` });
+                  const mn = v.min_price ?? v.minPrice ?? null;
+                  const mx = v.max_price ?? v.maxPrice ?? null;
+                  if (mn || mx) priceLine = `Price range: ${mn ?? "NA"} - ${mx ?? "NA"} ${v.currency ?? "INR"}`;
                 }
+                if (priceLine) parts.push(priceLine);
+              } catch (e) {}
+
+              // City, category, capacity, contact
+              if (v.city) parts.push(`City: ${v.city}`);
+              if (v.category) parts.push(`Category: ${v.category}`);
+              if (v.capacity) parts.push(`Capacity: ${v.capacity}`);
+              if (v.phone) parts.push(`Contact: ${v.phone}`);
+
+              // Images (list urls)
+              if (details.images && details.images.length) {
+                const imgs = details.images.slice(0, 5).map((i: any) => i.url).filter(Boolean);
+                if (imgs.length) parts.push(`Images: ${imgs.join(", ")}`);
+              }
+
+              // Stats
+              if (details.stats) {
+                const avg = details.stats.avg_rating ?? v.avg_rating ?? v.avgRating ?? null;
+                const cnt = details.stats.review_count ?? v.rating_count ?? v.ratingCount ?? null;
+                if (avg !== null || cnt !== null) parts.push(`Rating: ${avg ?? "N/A"} / 5 (${cnt ?? 0} reviews)`);
+              }
+
+              // Top reviews
+              if (details.top_reviews && details.top_reviews.length) {
+                parts.push("Recent reviews:");
+                for (const r of details.top_reviews.slice(0, 3)) {
+                  const body = r.body ?? r.text ?? "";
+                  parts.push(`- ${r.rating ?? "N/A"}/5 ${r.reviewer_name ? `by ${r.reviewer_name}: ` : ""}${(r.title ? r.title + " - " : "")}${body}`);
+                }
+              }
+
+              writer.write({ type: "text-delta", id: textId, delta: parts.join("\n\n") });
+
+              // Also emit a JSON sentinel for the UI to render a detailed card
+              try {
+                const payload = {
+                  type: "vendor_details",
+                  vendor_id: v.id ?? null,
+                  name: v.name ?? null,
+                  refined_short_description: v.short_description ?? null,
+                  price_range:
+                    (v.min_price || v.max_price) ? `${v.min_price ?? "NA"} - ${v.max_price ?? "NA"} ${v.currency ?? "INR"}` : null,
+                  city: v.city ?? null,
+                  avg_rating: details.stats?.avg_rating ?? v.avg_rating ?? null,
+                  review_count: details.stats?.review_count ?? v.rating_count ?? null,
+                  top_reviews: (details.top_reviews || []).slice(0, 5).map((r: any) => ({ rating: r.rating, title: r.title, body: r.body ?? r.text, reviewer_name: r.reviewer_name })),
+                  images: (details.images || []).slice(0, 10).map((i: any) => ({ url: i.url, caption: i.caption, is_main: i.is_main })),
+                  offers: (details.offers || []).slice(0, 10).map((of: any) => ({ title: of.title, description: of.description, price: of.price, currency: of.currency, min_persons: of.min_persons, max_persons: of.max_persons })),
+                };
+                writer.write({
+                  type: "text-delta",
+                  id: textId,
+                  delta: `\n\n__VENDOR_DETAILS_JSON__${JSON.stringify(payload)}__END_VENDOR_DETAILS_JSON__`,
+                });
+              } catch (e) {
+                console.warn("[chat] failed to emit vendor details JSON sentinel:", e);
+              }
+
+            } else {
+              // fallback web search
+              const webRes = await webSearch(vendorName, { limit: 3 }).catch(() => null);
+              if (webRes && webRes.length) {
+                const summary = webRes.slice(0, 3).map((r: any, i: number) => `${i + 1}. ${r.title || r.name}\n${r.snippet || r.summary || ""}\n${r.url || ""}`).join("\n\n");
+                writer.write({ type: "text-delta", id: textId, delta: `Couldn't find this vendor in the internal DB. Here's what I found on the web:\n\n${summary}` });
+              } else {
+                writer.write({ type: "text-delta", id: textId, delta: `I couldn't find details for "${vendorName}".` });
               }
             }
 
@@ -312,11 +588,10 @@ export async function POST(req: Request) {
             return;
           }
 
-          // Handle "reviews" intent
+          // ---------- REVIEWS flow ----------
           if (isReviewsQuery(composedQuery)) {
             let vendorName = extractVendorNameFromReviews(composedQuery);
             if (!vendorName) {
-              // try context from previous assistant message
               const previousAssistant = messages?.slice().reverse().find((m) => m.role === "assistant");
               if (previousAssistant) {
                 const txt = (previousAssistant.parts || []).map((p: any) => p.text || "").join(" ");
@@ -325,20 +600,30 @@ export async function POST(req: Request) {
               }
             }
             if (!vendorName) {
-              writer.write({ type: "text-delta", id: textId, delta: "Which vendor would you like reviews for? Please say 'Reviews for <vendor name>'. " });
+              writer.write({ type: "text-delta", id: textId, delta: "Which vendor would you like reviews for? Please say 'Reviews for <vendor name>'." });
               writer.write({ type: "text-end", id: textId });
               writer.write({ type: "finish" });
               return;
             }
 
-            // Look up in DB first
             try {
               if (supabase) {
                 const { data: v } = await supabase.from("vendors").select("id, name").ilike("name", `%${vendorName}%`).limit(1).maybeSingle();
                 if (v && v.id) {
-                  const { data: revs } = await supabase.from("vendor_reviews").select("rating, text, author, created_at").eq("vendor_id", v.id).order("created_at", { ascending: false }).limit(50);
+                  // use helper if available to fetch top reviews
+                  let revs = null;
+                  try {
+                    const details = await getVendorDetails(String(v.id));
+                    if (details && details.top_reviews && details.top_reviews.length) revs = details.top_reviews;
+                  } catch (e) {
+                    // ignore
+                  }
+                  if (!revs) {
+                    const { data: revsDirect } = await supabase.from("vendor_reviews").select("rating, title, body, reviewer_name, review_ts").eq("vendor_id", v.id).order("review_ts", { ascending: false }).limit(50);
+                    revs = revsDirect || [];
+                  }
                   if (revs && revs.length) {
-                    const lines = revs.map((r: any) => `- ${r.rating}/5 ${r.author ? `by ${r.author}: ` : ""}${r.text}`);
+                    const lines = revs.map((r: any) => `- ${r.rating}/5 ${r.reviewer_name ? `by ${r.reviewer_name}: ` : ""}${(r.title ? r.title + " - " : "")}${r.body ?? r.text ?? ""}`);
                     writer.write({ type: "text-delta", id: textId, delta: `Recent reviews for ${v.name}:\n\n${lines.join("\n")}` });
                     writer.write({ type: "text-end", id: textId });
                     writer.write({ type: "finish" });
@@ -350,7 +635,6 @@ export async function POST(req: Request) {
               console.warn("[chat] reviews DB fetch failed:", e);
             }
 
-            // fallback to web search
             const webRes = await webSearch(vendorName, { limit: 6 }).catch(() => null);
             if (webRes && webRes.length) {
               const snippets = webRes.map((r: any, i: number) => `${i + 1}. ${r.title || r.name}\n${r.snippet || r.summary || ""}\n${r.url || ""}`);
@@ -364,7 +648,7 @@ export async function POST(req: Request) {
             return;
           }
 
-          // Generic vendor search path (detect budget/category)
+          // ---------- GENERIC vendor search (semantic) ----------
           const budgetVal = parseBudget(composedQuery);
           const categoryVal = parseCategory(composedQuery);
           const looksSpecific = Boolean(budgetVal || categoryVal || /\b(powai|bandra|andheri|khar|juhu|thane|navi mumbai|lower parel|colaba|churchgate)\b/i.test(composedQuery));
@@ -376,7 +660,6 @@ export async function POST(req: Request) {
             return;
           }
 
-          // perform semantic search
           const semanticQueryParts = [composedQuery];
           if (categoryVal) semanticQueryParts.push(categoryVal);
           if (budgetVal) semanticQueryParts.push(`budget ${budgetVal}`);
@@ -395,10 +678,8 @@ export async function POST(req: Request) {
 
           const vectResults = await normalizeVectorResults(searchRes);
 
-          // collect vendor ids from metadata if present
           const vendorIds = (vectResults || []).map((v: any) => v.vendor_id || v._id || v.id || (v.metadata && (v.metadata.vendor_id || v.metadata.id))).filter(Boolean);
 
-          // DB fetch if possible
           let dbRows = [];
           if (supabase && vendorIds.length) {
             try {
@@ -409,7 +690,6 @@ export async function POST(req: Request) {
             }
           }
 
-          // name-based fallback lookups if dbRows empty
           if (supabase && dbRows.length === 0 && vectResults.length) {
             const maybeNames = vectResults.slice(0, 6).map((v) => v.name || v.title || v.vendor_name).filter(Boolean);
             for (const nm of maybeNames) {
@@ -420,7 +700,6 @@ export async function POST(req: Request) {
                 // ignore
               }
             }
-            // dedupe
             const seen = new Set();
             dbRows = dbRows.filter((r: any) => {
               if (seen.has(r.id)) return false;
@@ -429,7 +708,6 @@ export async function POST(req: Request) {
             });
           }
 
-          // merge results preserving vector order
           const idToRow: any = {};
           for (const r of dbRows) idToRow[r.id] = r;
           const merged = [];
@@ -440,7 +718,6 @@ export async function POST(req: Request) {
           }
           if (merged.length === 0 && dbRows.length) merged.push(...dbRows);
 
-          // budget filter on merged results if budget provided
           let filtered = merged;
           if (budgetVal) {
             filtered = merged.filter((v: any) => {
@@ -456,7 +733,6 @@ export async function POST(req: Request) {
 
           const top = (filtered.length ? filtered : merged).slice(0, 6);
 
-          // build conversational paragraphs
           const paragraphs = top.map((v: any, idx: number) => {
             const name = v.name ?? v.title ?? v.vendor_name ?? `Vendor ${idx + 1}`;
             const category = v.category ?? "vendor";
@@ -485,7 +761,6 @@ export async function POST(req: Request) {
 
           writer.write({ type: "text-delta", id: textId, delta: conversational });
 
-          // structured payload sentinel
           const structured = top.map((v: any) => ({
             id: v.id ?? v.vendor_id ?? v._id ?? null,
             name: v.name ?? v.title ?? v.vendor_name ?? null,
