@@ -1,32 +1,40 @@
 // components/messages/message-wall.tsx
 "use client";
 import React, { useEffect, useRef, useMemo } from "react";
-import { useChat } from "@ai-sdk/react"; // <-- correct package for hook
+import { useChat } from "@ai-sdk/react"; // correct hook source
 import type { UIMessage } from "ai";
 import { AssistantMessage } from "./assistant-message";
 import { UserMessage } from "./user-message";
 
-/**
- * Simple MessageWall that consumes useChat() messages and renders them.
- * Exports a named MessageWall so page.tsx's `import { MessageWall }` works.
- *
- * This component intentionally avoids printing any raw JSON sentinels
- * into the visible chat stream — structured payloads (tool-result)
- * are passed to AssistantMessage via props for UI rendering.
- */
+type MessageWallProps = {
+  messages?: UIMessage[]; // optional — if provided, will be used
+  status?: "error" | "streaming" | "submitted" | "ready";
+  durations?: Record<string, number>;
+  onDurationChange?: (key: string, duration: number) => void;
+};
 
-export function MessageWall() {
-  const { messages, status, clear } = useChat();
+/**
+ * MessageWall
+ * - Accepts optional props (compatible with earlier page.tsx)
+ * - Falls back to useChat() when props are not passed
+ * - Does not print raw JSON sentinels into visible chat text
+ */
+export function MessageWall(props: MessageWallProps) {
+  // Prefer props if caller passed messages/status (keeps backwards compatibility)
+  const chat = useChat();
+  const messages = props.messages ?? (chat?.messages ?? []);
+  const status = props.status ?? (chat?.status ?? "ready");
+  const onDurationChange = props.onDurationChange ?? chat?.onDurationChange;
+  const durations = props.durations ?? chat?.durations ?? {};
+
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  // Flatten messages to a stable array for rendering
   const renderedMessages = useMemo(() => (messages || []).slice(), [messages]);
 
-  // Auto-scroll to bottom when messages change
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    // small timeout to allow DOM to update
+    // scroll after frame so layout is stable
     requestAnimationFrame(() => {
       el.scrollTop = el.scrollHeight;
     });
@@ -41,21 +49,21 @@ export function MessageWall() {
       >
         {renderedMessages.map((m: UIMessage, i: number) => {
           const role = m.role ?? "assistant";
-          // combine text parts into one string
+
+          // assemble plaintext from text parts
           const textParts = (m.parts || [])
             .filter((p: any) => p.type === "text")
             .map((p: any) => p.text ?? "")
             .join("");
 
-          // find any tool-result parts (the streaming protocol writes tool-result events separately)
-          // In some SDKs tool results come as `parts` too; handle conservatively:
-          const toolResultPart = (m.parts || []).find((p: any) => p.type === "tool-result" || p.type === "json");
-          const toolResult = toolResultPart ? toolResultPart.content ?? toolResultPart.value ?? toolResultPart : null;
+          // detect tool-result parts (some SDKs send them as parts; keep defensive)
+          const toolPart = (m.parts || []).find((p: any) => p.type === "tool-result" || p.type === "json" || p.type === "tool");
+          const toolResult = toolPart ? (toolPart.content ?? toolPart.value ?? toolPart) : null;
 
-          // Provide both the raw message and parsed tool result to AssistantMessage so it can render cards/rows.
           if (role === "user") {
             return <UserMessage key={m.id ?? i} message={m} text={textParts} />;
           } else {
+            // Assistant message gets text and toolResult payload (if any)
             return (
               <AssistantMessage
                 key={m.id ?? i}
@@ -79,7 +87,7 @@ export function MessageWall() {
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => clear?.()}
+              onClick={() => (chat?.clear ? chat.clear() : undefined)}
               className="text-xs underline"
               title="Clear chat"
             >
