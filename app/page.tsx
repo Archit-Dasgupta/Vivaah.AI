@@ -95,7 +95,6 @@ export default function Chat() {
         });
       } catch (err) {
         // best-effort; ignore errors here
-        // console.warn("handleMoreDetails sendMessage failed", err);
       }
     }
 
@@ -169,8 +168,6 @@ export default function Chat() {
   };
 
   function onSubmit(data: z.infer<typeof formSchema>) {
-    // Pass sessionKey inside metadata to align with sendMessage types
-    // sendMessage typing is permissive above so this call should compile across SDK versions
     sendMessage({
       text: data.message,
       metadata: { sessionKey: getOrCreateSessionKey() },
@@ -186,7 +183,7 @@ export default function Chat() {
           <ChatHeader>
             <ChatHeaderBlock />
             <ChatHeaderBlock className="justify-center items-center gap-2">
-              <Avatar className="size-8 ring-2 ring-[var(--gold-1)]">
+              <Avatar className="size-8 ring-2 ring-[var(--gold-1)] avatar-ring">
                 <AvatarImage src="/logo.png" />
                 <AvatarFallback>
                   <Image src="/logo.png" alt="Logo" width={36} height={36} />
@@ -212,34 +209,41 @@ export default function Chat() {
         </div>
 
         {/* ===== Messages ===== */}
-        <div className="h-screen overflow-y-auto px-5 py-4 pt-[100px] pb-[150px]">
+        <div className="h-screen overflow-y-auto px-5 py-4 pt-[120px] pb-[170px]">
           <div className="flex flex-col items-center">
-            {isClient ? (
-              <>
-                <MessageWall
-                  messages={messages}
-                  status={status}
-                  durations={durations}
-                  // Correct signature: (key: string, duration: number)
-                  onDurationChange={(key: string, duration: number) => {
-                    setDurations((prev) => {
-                      const updated = { ...prev, [key]: duration };
-                      try {
-                        if (typeof window !== "undefined") {
-                          localStorage.setItem(STORAGE_KEY, JSON.stringify({ messages, durations: updated }));
-                        }
-                      } catch {}
-                      return updated;
-                    });
-                  }}
-                />
-                {status === "submitted" && (
-                  <Loader2 className="size-4 animate-spin text-[var(--text-maroon)]" />
+            <div className="w-full">
+              <div className="chat-card">
+                {isClient ? (
+                  <>
+                    <MessageWall
+                      messages={messages}
+                      status={status}
+                      durations={durations}
+                      onDurationChange={(key: string, duration: number) => {
+                        setDurations((prev) => {
+                          const updated = { ...prev, [key]: duration };
+                          try {
+                            if (typeof window !== "undefined") {
+                              localStorage.setItem(STORAGE_KEY, JSON.stringify({ messages, durations: updated }));
+                            }
+                          } catch {}
+                          return updated;
+                        });
+                      }}
+                    />
+                    {status === "submitted" && (
+                      <div className="flex justify-center pt-4">
+                        <Loader2 className="size-4 animate-spin text-[var(--text-maroon)]" />
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="flex justify-center py-8">
+                    <Loader2 className="size-4 animate-spin text-[var(--text-maroon)]" />
+                  </div>
                 )}
-              </>
-            ) : (
-              <Loader2 className="size-4 animate-spin text-[var(--text-maroon)]" />
-            )}
+              </div>
+            </div>
           </div>
         </div>
 
@@ -254,7 +258,7 @@ export default function Chat() {
                   render={({ field, fieldState }) => (
                     <Field data-invalid={fieldState.invalid}>
                       <FieldLabel className="sr-only">Message</FieldLabel>
-                      <div className="relative">
+                      <div className="relative input-pill">
                         <Input
                           {...field}
                           placeholder="Type your message..."
@@ -267,9 +271,10 @@ export default function Chat() {
                             type="submit"
                             disabled={!field.value.trim()}
                             size="icon"
-                            className="absolute right-3 top-3"
+                            className="button-icon absolute right-3 top-3"
+                            aria-label="Send message"
                           >
-                            <ArrowUp className="size-4 text-white" />
+                            <ArrowUp className="size-4" />
                           </Button>
                         )}
 
@@ -277,13 +282,14 @@ export default function Chat() {
                           status === "submitted") && (
                           <Button
                             size="icon"
-                            className="absolute right-3 top-3 bg-[var(--gold-2)]"
+                            className="button-icon stream-stop absolute right-3 top-3"
                             onClick={(e) => {
                               e.preventDefault();
                               stop();
                             }}
+                            aria-label="Stop generation"
                           >
-                            <Square className="size-4 text-white" />
+                            <Square className="size-4" />
                           </Button>
                         )}
                       </div>
